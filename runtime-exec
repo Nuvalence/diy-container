@@ -1,0 +1,111 @@
+#!/bin/bash
+
+set -e
+
+[[ -n "$VERBOSE" ]] && set -x
+
+CONTAINER_SUBNET_CIDR=10.178.61.1/24
+CONTAINER_IP=10.178.61.2
+
+#
+# Host network setup
+#
+
+# Enable packet forwarding
+IP_FORWARD=$(cat /proc/sys/net/ipv4/ip_forward)
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Allow forwarding of packets to and from the container subnet
+iptables -A FORWARD -s $CONTAINER_SUBNET_CIDR -j ACCEPT
+iptables -A FORWARD -d $CONTAINER_SUBNET_CIDR -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Re-write the source address for packets originating from the container subnet
+iptables -t nat -A POSTROUTING -s $CONTAINER_SUBNET_CIDR -j MASQUERADE
+
+# Create a bridge device to act as a gateway for the container subnet
+ip link add dev br-container type bridge
+
+# Set the bridges's IP
+ip addr add $CONTAINER_SUBNET_CIDR dev br-container
+
+# Create two peered virtual ethernet adapters
+ip link add dev veth-host type veth peer name veth-container
+
+# Assign the host's virtual adapter to the bridge
+ip link set dev veth-host master br-container
+
+# Bring up devices
+ip link set dev veth-host up
+ip link set dev br-container up
+
+#
+# Network namespace setup
+#
+
+# Create a network namespace
+ip netns add container
+
+# Assign the container's virtual adapter to the namespace
+ip link set dev veth-container netns container
+
+# Set the container's IP
+ip netns exec container \
+    ip addr add dev veth-container $CONTAINER_IP/$(basename $CONTAINER_SUBNET_CIDR)
+
+# Bring up the container's device
+ip netns exec container \
+    ip link set dev veth-container up
+
+# Set the container's default route
+ip netns exec container \
+    ip route add default via $(dirname $CONTAINER_SUBNET_CIDR)
+
+#
+# Container filesystem setup
+#
+
+# Create the upper, work, and rootfs directories
+mkdir upperdir workdir rootfs
+
+# Set directory defaults
+[[ -z "$LOWER_DIR" ]] && LOWER_DIR=layers/2:layers/1
+[[ -z "$UPPER_DIR" ]] && UPPER_DIR=upperdir
+
+# Create an overlay filesystem
+mount -t overlay overlay -o lowerdir=$LOWER_DIR,upperdir=$UPPER_DIR,workdir=workdir rootfs
+
+# Setup /sys
+mount --bind /sys rootfs/sys
+
+#
+# Define cleanup routine
+#
+
+function cleanup()
+{
+    # Revert host network setup
+    ip link del veth-host
+    ip link del br-container
+    iptables -t nat -D POSTROUTING -s $CONTAINER_SUBNET_CIDR -j MASQUERADE
+    iptables -D FORWARD -d $CONTAINER_SUBNET_CIDR -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -D FORWARD -s $CONTAINER_SUBNET_CIDR -j ACCEPT
+    echo $IP_FORWARD > /proc/sys/net/ipv4/ip_forward
+
+    # Cleanup the network namespace
+    ip netns del container
+
+    # Cleanup the container filesystem
+    umount rootfs/sys rootfs
+    rm -rf upperdir workdir rootfs
+}
+
+# Call cleanup on exit
+trap cleanup EXIT
+
+#
+# Launch the container
+#
+
+# Enter namespaces and exec the provided command
+ip netns exec container \
+    unshare --pid --ipc --uts --cgroup --mount --root=rootfs --mount-proc --fork "$@"
